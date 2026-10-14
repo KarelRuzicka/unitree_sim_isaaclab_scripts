@@ -1,0 +1,349 @@
+import math
+import threading
+import time
+from typing import Literal, Optional, Tuple
+import logging
+import logging_mp
+
+import cv2
+from teleimager.image_client import ImageClient
+
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # type: ignore
+from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_ # type: ignore
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ # type: ignore
+
+
+def _quat_xyzw_to_yaw_rad(x: float, y: float, z: float, w: float) -> float:
+    """Convert quaternion (x, y, z, w) to yaw (radians)."""
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _wrap_to_pi(angle_rad: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+def wrap_to_180(angle_deg: float) -> float:
+    """Wrap angle to [-180, 180] degrees."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+############################################################
+# Robot Controller
+############################################################
+
+class RobotController:
+
+    def __init__(
+        self,
+        domain_id: int = 1,
+        topic: str = "rt/run_command/cmd",
+        lowstate_topic: str = "rt/lowstate",
+        default_height: float = -0.5,
+        rate_hz: float = 100.0,
+    ) -> None:
+        # HighState DDS publisher for movement commands
+        ChannelFactoryInitialize(domain_id)
+        self._publisher = ChannelPublisher(topic, String_)
+        self._publisher.Init()
+
+        # LowState DDS subscriber for IMU yaw feedback
+        self._yaw_lock = threading.Lock()
+        self._latest_yaw_rad: Optional[float] = None
+        self._latest_lowstate_ts: float = 0.0
+
+        self._lowstate_sub = ChannelSubscriber(lowstate_topic, LowState_)
+        self._lowstate_sub.Init(self._on_lowstate, 32)
+
+        self._default_height = float(default_height)
+        self.tolerance_deg = 0.85
+        
+        self._period = 1.0 / rate_hz if rate_hz > 0 else 0.01
+
+    def _on_lowstate(self, msg: LowState_) -> None:
+        """DDS callback: cache latest yaw from IMU quaternion."""
+        try:
+            q = msg.imu_state.quaternion
+            # unitree_sim_isaaclab/dds/g1_robot_dds.py publishes quaternion as [x, y, z, w]
+            yaw = _quat_xyzw_to_yaw_rad(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+            with self._yaw_lock:
+                self._latest_yaw_rad = yaw
+                self._latest_lowstate_ts = time.time()
+        except Exception:
+            return
+
+    # ------------------------------------------------------------------
+
+    def send_command(
+        self,
+        x_vel: float = 0.0,
+        y_vel: float = 0.0,
+        yaw_vel: float = 0.0,
+        height: Optional[float] = None,
+    ) -> None:
+        if height is None:
+            height = self._default_height
+
+        commands_list = [
+            float(x_vel),
+            -float(y_vel),
+            -float(yaw_vel),
+            float(height),
+        ]
+        msg = String_(data=str(commands_list))
+        self._publisher.Write(msg)
+
+    def move_for_duration(
+        self,
+        duration_sec: float,
+        x_vel: float = 0.0,
+        y_vel: float = 0.0,
+        yaw_vel: float = 0.0,
+        height: Optional[float] = None,
+    ) -> None:
+        """Send a constant velocity command for a given duration, then stop."""
+        end_time = time.time() + float(duration_sec)
+        while time.time() < end_time:
+            self.send_command(x_vel=x_vel, y_vel=y_vel, yaw_vel=yaw_vel, height=height)
+            time.sleep(self._period)
+
+        # Send a final stop command (zero velocities, keep height)
+        self.stop(height=height)
+        
+    def stop(self, height: Optional[float] = None) -> None:
+        """Send a zero-velocity command"""
+
+        self.send_command(0.0, 0.0, 0.0, height)
+        
+        
+    def get_yaw_rad(self) -> Optional[float]:
+        """Get latest yaw (radians) from rt/lowstate, or None if not available yet."""
+        with self._yaw_lock:
+            return self._latest_yaw_rad
+
+    def get_yaw_deg(self) -> Optional[float]:
+        """Get latest yaw (degrees) from rt/lowstate, or None if not available yet."""
+        yaw = self.get_yaw_rad()
+        return None if yaw is None else math.degrees(yaw)
+    
+    
+    def rotate(
+        self,
+        degrees: float,
+        yaw_speed: float = 2.0,
+        height: Optional[float] = None,
+    ) -> None:
+        """Rotate in place by a relative angle in degrees in range <-180, +180> where positive values correspond to counter-clockwise (left) rotation."""
+        
+        if degrees > 180.0 or degrees < -180.0:
+            raise ValueError("Rotation degrees must be in range <-180, +180>.")
+        
+        if height is None:
+            height = self._default_height
+
+        # Try to get current yaw in degrees
+        current = self.get_yaw_deg()
+        
+        if current is None:
+            raise RuntimeError("Current yaw is not available yet.")
+        
+        target = wrap_to_180(current + degrees)
+        
+        desired_sign = 1.0 if degrees > 0.0 else -1.0
+
+        # Initial direction based on desired delta
+        cmd = (abs(yaw_speed) if degrees < 0.0 else -abs(yaw_speed))
+
+        while True:
+            current = self.get_yaw_deg()
+
+            if current is not None:
+                error = wrap_to_180(target - current)  # degrees
+                # Stop if within tolerance
+                if abs(error) <= self.tolerance_deg:
+                    # print("Primary stop triggered")
+                    break
+                # print(f"Current: {current:.2f}°, Target: {target:.2f}°, Error: {error:.2f}°")
+                # Fallback if we overshoot
+                if (error * desired_sign) < 0.0:
+                    # print("Fallback stop triggered")
+                    break
+
+            # Command yaw rate, keep x/y zero
+            self.send_command(x_vel=0.0, y_vel=0.0, yaw_vel=cmd, height=height)
+            time.sleep(self._period)
+
+        self.stop(height=height)
+
+
+############################################################
+# TeleImager
+############################################################
+
+class TeleImagerSnapshotClient:
+    """Small helper around TeleImager's `ImageClient` to fetch frames and save snapshots.
+
+    This is a class-based version of `teleimager_snapshot.py` so it can be used
+    from inside the Unitree simulator robot wrapper.
+    """
+
+    _CAMERA_TO_METHOD = {
+        "head": "get_head_frame",
+        "left": "get_left_wrist_frame",
+        "right": "get_right_wrist_frame",
+    }
+
+    def __init__(self, host: str = "127.0.0.1") -> None:
+        
+        logger = logging.getLogger("teleimager.image_client")
+        logger.setLevel(logging.WARNING)
+        
+        self._host = host
+        self._client = ImageClient(host=host)
+        
+ 
+
+    def close(self) -> None:
+        self._client.close()
+
+    def get_frame(self, camera: str = "head") -> Tuple[Optional["cv2.typing.MatLike"], float]:
+        """Return the latest frame (or None) and the receive FPS estimate."""
+        if camera not in self._CAMERA_TO_METHOD:
+            raise ValueError(f"Unknown camera '{camera}'. Expected one of {sorted(self._CAMERA_TO_METHOD)}")
+        method = getattr(self._client, self._CAMERA_TO_METHOD[camera])
+        img, fps = method()
+        return img, float(fps)
+
+
+############################################################
+# Instances
+############################################################
+
+robot_controller = RobotController()
+teleimager_client = TeleImagerSnapshotClient(host="127.0.0.1")
+
+
+############################################################
+# Scripting Functions
+############################################################
+   
+def walk(direction: Literal["forward", "backward", "left", "right"], duration_sec: float) -> None:
+    """
+    Walk the robot in the specified direction for a given duration and speed.
+    4 seconds of walking roughly equates to 1 meter.
+    """
+    speed = 1
+    print(f"[UnitreeRobot] Walking {direction} for {duration_sec} seconds at speed {speed}")
+    
+    try:
+        match direction:
+            case "forward":
+                robot_controller.move_for_duration(duration_sec, x_vel=abs(speed), y_vel=0.0, yaw_vel=0.0)
+            case "backward":
+                robot_controller.move_for_duration(duration_sec, x_vel=-abs(speed), y_vel=0.0, yaw_vel=0.0)
+            case "left":
+                robot_controller.move_for_duration(duration_sec, x_vel=0.0, y_vel=-abs(speed), yaw_vel=0.0)
+            case "right":
+                robot_controller.move_for_duration(duration_sec, x_vel=0.0, y_vel=abs(speed), yaw_vel=0.0)
+    except Exception as e:
+        print(f"[UnitreeRobot] Error while walking: {e}")
+        raise RuntimeError(f"Error while walking: {e}") from e
+        
+
+def rotate(angle: float) -> None:
+    """Rotate the robot in place by a relative angle in degrees in range <-180, +180> where positive values correspond to counter-clockwise (left) rotation."""
+    speed = 1.5
+    print(f"[UnitreeRobot] Rotating {angle} degrees at speed {speed}")
+    
+    try:
+        robot_controller.rotate(angle, speed)
+    except Exception as e:
+        print(f"[UnitreeRobot] Error while rotating: {e}")
+        raise RuntimeError(f"Error while rotating: {e}") from e
+    
+    time.sleep(1) # Let the rotation settle
+        
+        
+def get_rotation() -> float:
+    """Get the current absolute rotation of the robot in degrees."""
+    rotation = robot_controller.get_yaw_deg()
+    
+    if rotation is None:
+        print(f"[UnitreeRobot] Yaw not available yet.")
+        raise RuntimeError("Yaw not available yet.")
+        
+    print(f"[UnitreeRobot] Current rotation: {rotation} degrees")
+    return rotation
+        
+        
+def get_camera_snapshot(camera: Literal["head", "left", "right"] = "head") -> bytes:
+    """Get a snapshot from the specified camera as PNG bytes."""
+    print(f"[UnitreeRobot] Getting camera snapshot...")
+    try:
+        deadline = time.monotonic() + 5.0
+        last_fps = 0.0
+        while time.monotonic() < deadline:
+            img, fps = teleimager_client.get_frame(camera=camera)
+            last_fps = fps
+            if img is not None:
+                ok, buf = cv2.imencode(".png", img)
+                if not ok:
+                    raise RuntimeError("cv2.imencode('.png', img) failed")
+                return buf.tobytes()
+            time.sleep(0.02)
+
+        raise TimeoutError(
+            f"Timed out waiting for {camera} frame after 5.0s (last recv_fps≈{last_fps:.2f}). "
+            "Is the simulator running and the teleimager server enabled?"
+        )
+    except Exception as e:
+        print(f"[UnitreeRobot] Error while getting camera snapshot: {e}")
+        raise RuntimeError(f"Error while getting camera snapshot: {e}") from e
+
+
+############################################################
+# Demo
+############################################################
+
+if __name__ == "__main__":
+
+    time.sleep(5)
+    
+    # Walk backward
+    walk("backward", 2)
+    time.sleep(2)
+    
+    # Rotate 90
+    print(get_rotation())
+    rotate(90)
+    print(get_rotation())
+    
+    time.sleep(10)
+    
+    # Walk forward
+    walk("forward", 5)
+    time.sleep(2)
+    
+    # Rotate -180
+    rotate(-180)
+    
+    # Walk left
+    walk("left", 2)
+    
+    
+    time.sleep(5)
+    
+    # Get head camera snapshot
+    image_bytes = get_camera_snapshot("head")
+    out_path = f"camera_snapshot_head.png"
+
+    with open(out_path, "wb") as f:
+        f.write(image_bytes)
+        
+    # Get left arm camera snapshot
+    image_bytes = get_camera_snapshot("left")
+    out_path = f"camera_snapshot_left.png"
+
+    with open(out_path, "wb") as f:
+        f.write(image_bytes)
+        

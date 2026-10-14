@@ -1,0 +1,24 @@
+xhost +local:docker
+
+sudo docker run --gpus all -it --rm \
+--network host \
+-e NVIDIA_VISIBLE_DEVICES=all \
+-e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics,display \
+-e LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH \
+-e DISPLAY=$DISPLAY \
+-e VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json \
+-v /etc/vulkan/icd.d:/etc/vulkan/icd.d:ro \
+-v /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro \
+-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+-v /usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.580.95.05:/usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.580.95.05:ro \
+unitree-sim /bin/bash
+
+cd unitree_sim_isaaclab
+
+python sim_main.py --device cuda  --enable_cameras  --task Isaac-Move-Cylinder-G129-Dex1-Wholebody  --enable_dex1_dds --robot_type g129
+
+
+apt update
+apt install git-lfs
+. fetch_assets.sh
+
